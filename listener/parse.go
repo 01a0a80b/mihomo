@@ -175,6 +175,13 @@ func ParseListener(mapping map[string]any) (C.InboundListener, error) {
 			return nil, err
 		}
 		listener, err = IN.NewTrustTunnel(trusttunnelOption)
+	case "shadowlemon":
+		shadowLemonOption := &IN.ShadowLemonOption{}
+		err = decoder.Decode(mapping, shadowLemonOption)
+		if err != nil {
+			return nil, err
+		}
+		listener, err = IN.NewShadowLemon(shadowLemonOption)
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}
