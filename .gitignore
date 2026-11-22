@@ -21,6 +21,10 @@ vendor
 # macOS file
 .DS_Store
 
+# Local-only agent instructions & docs (never committed)
+AGENTS.md
+docs/
+
 # test suite
 test/config/cache*
 /output
