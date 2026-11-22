@@ -375,20 +375,6 @@ dns:
     # "rule-set:global,dns": 8.8.8.8
 
 proxies: # socks5
-  # shadowlemon - 加密代理（UDP 传输，版本 4）
-  # 部署密钥必须通过环境变量 SHADOWLEMON_ENVELOPE_SECRET 设置，
-  # 或在 deployment-secret 字段直接给出（两端必须一致）。
-  - name: "shadowlemon"
-    type: shadowlemon
-    server: server
-    port: 443
-    username: username
-    password: password
-    udp: true
-    # mtu: 1400
-    # deployment-secret: "replace-with-a-high-entropy-shared-secret"
-    # cipher-suites: ["XChaCha20-Poly1305", "AES-256-GCM", "AES-128-GCM"]
-
   - name: "socks"
     type: socks5
     server: server
@@ -2050,18 +2036,6 @@ sub-rules:
 
 # 流量入站
 listeners:
-  # shadowlemon - 加密代理入站（UDP 传输，版本 4）
-  # 部署密钥必须通过环境变量 SHADOWLEMON_ENVELOPE_SECRET 设置，
-  # 或在 deployment-secret 字段直接给出（两端必须一致）。
-  - name: shadowlemon-in
-    type: shadowlemon
-    port: 10809
-    # listen: 0.0.0.0
-    users: # 用户名 -> 密码
-      user1: password1
-    # mtu: 1400
-    # deployment-secret: "replace-with-a-high-entropy-shared-secret"
-
   - name: socks5-in-1
     type: socks
     port: 10808 # 支持使用ports格式，例如200,302 or 200,204,401-429,501-503
