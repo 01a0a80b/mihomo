@@ -23,7 +23,7 @@ import (
 
 type ServerOption struct {
 	HandleTcpFn func(conn net.Conn, addr socks5.Addr, additions ...inbound.Addition) error
-	HandleUdpFn func(addr socks5.Addr, packet C.UDPPacket, additions ...inbound.Addition) error
+	HandleUdpFn func(addr socks5.Addr, packet C.UDPPacketPeer, additions ...inbound.Addition) error
 
 	TlsConfig             *tls.Config
 	QuicConfig            *quic.Config

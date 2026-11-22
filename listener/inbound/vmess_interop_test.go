@@ -262,7 +262,7 @@ func vmessInteropDirectTunnel(t *testing.T) *TestTunnel {
 			}
 			N.Relay(target, conn)
 		},
-		HandleUDPPacketFn: func(packet C.UDPPacket, metadata *C.Metadata) {
+		HandleUDPPacketFn: func(packet *C.UDPPacket, metadata *C.Metadata) {
 			packet.Drop()
 		},
 		NatTableFn: func() C.NatTable {

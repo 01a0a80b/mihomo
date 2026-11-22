@@ -5,12 +5,12 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
-	N "github.com/metacubex/mihomo/common/net"
-	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
 	C "github.com/metacubex/mihomo/constant"
@@ -30,6 +30,8 @@ import (
 	"github.com/metacubex/http"
 	"github.com/metacubex/smux"
 	"github.com/metacubex/tls"
+
+	"github.com/metacubex/sing/common/buf"
 )
 
 type Listener struct {
@@ -330,7 +332,8 @@ func (l *Listener) handleConn(inMux bool, conn net.Conn, tunnel C.Tunnel, additi
 	case trojan.CommandUDP:
 		pc := trojan.NewPacketConn(conn)
 		remoteAddr := conn.RemoteAddr()
-		connID := utils.NewUUIDV4().String() // make a new SNAT key
+		src := remoteAddr.(interface{ AddrPort() netip.AddrPort }).AddrPort()
+		inboundID := udpkey.NextInbound()
 
 		for {
 			data, put, addr, err := pc.WaitReadFrom()
@@ -341,15 +344,22 @@ func (l *Listener) handleConn(inMux bool, conn net.Conn, tunnel C.Tunnel, additi
 				break
 			}
 			target := socks5.ParseAddrToSocksAddr(addr)
-			cPacket := &packet{
-				pc:      pc,
-				rAddr:   remoteAddr,
-				payload: data,
-				put:     put,
+			b := buf.NewPacket()
+			b.Write(data)
+			if put != nil {
+				put()
 			}
-			cPacket.rAddr = N.NewCustomAddr(C.TROJAN.String(), connID, cPacket.rAddr) // for tunnel's handleUDPConn
-
-			tunnel.HandleUDPPacket(inbound.NewPacket(target, cPacket, C.TROJAN, additions...))
+			flow := udpkey.Make(inboundID, src)
+			cPacket := &flowPacket{
+				packet: &packet{
+					Buffer: b,
+					pc:     pc,
+				},
+				flowKey: flow,
+			}
+			_, metadata := inbound.NewPacket(target, cPacket, C.TROJAN, additions...)
+			up := C.NewUDPPacket(cPacket.Buffer, metadata, flow, cPacket)
+			tunnel.HandleUDPPacket(up, metadata)
 		}
 	case trojan.CommandMux:
 		if inMux {
@@ -372,4 +382,13 @@ func (l *Listener) handleConn(inMux bool, conn net.Conn, tunnel C.Tunnel, additi
 			go l.handleConn(true, stream, tunnel, additions...)
 		}
 	}
+}
+
+type flowPacket struct {
+	*packet
+	flowKey udpkey.FlowKey
+}
+
+func (p *flowPacket) FlowKey() udpkey.FlowKey {
+	return p.flowKey
 }

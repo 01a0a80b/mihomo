@@ -6,17 +6,21 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	"github.com/metacubex/mihomo/common/sockopt"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/socks5"
+
+	"github.com/metacubex/sing/common/buf"
 )
 
 type UDPListener struct {
 	packetConn net.PacketConn
 	addr       string
 	closed     bool
+	inboundID  uint32
 }
 
 // RawAddress implements C.Listener
@@ -58,6 +62,7 @@ func NewUDPWithConfig(config LC.AuthServer, lc C.InboundListenConfig, tunnel C.T
 	sl := &UDPListener{
 		packetConn: l,
 		addr:       config.Listen,
+		inboundID:  udpkey.NextInbound(),
 	}
 	conn := N.NewEnhancePacketConn(l)
 	go func() {
@@ -72,27 +77,32 @@ func NewUDPWithConfig(config LC.AuthServer, lc C.InboundListenConfig, tunnel C.T
 				}
 				continue
 			}
-			handleSocksUDP(l, tunnel, data, put, remoteAddr, additions...)
+			b := buf.NewPacket()
+			b.Write(data)
+			if put != nil {
+				put()
+			}
+			handleSocksUDP(l, tunnel, b, remoteAddr, sl.inboundID, additions...)
 		}
 	}()
 
 	return sl, nil
 }
 
-func handleSocksUDP(pc net.PacketConn, tunnel C.Tunnel, buf []byte, put func(), addr net.Addr, additions ...inbound.Addition) {
-	target, payload, err := socks5.DecodeUDPPacket(buf)
+func handleSocksUDP(pc net.PacketConn, tunnel C.Tunnel, b *buf.Buffer, addr net.Addr, inboundID uint32, additions ...inbound.Addition) {
+	target, payload, err := socks5.DecodeUDPPacket(b.Bytes())
 	if err != nil {
-		// Unresolved UDP packet, return buffer to the pool
-		if put != nil {
-			put()
-		}
+		b.Release()
 		return
 	}
-	packet := &packet{
+	b.Advance(len(b.Bytes()) - len(payload))
+	pkt := &packet{
+		Buffer:  b,
 		pc:      pc,
 		rAddr:   addr,
-		payload: payload,
-		put:     put,
+		flowKey: udpkey.Make(inboundID, addr.(*net.UDPAddr).AddrPort()),
 	}
-	tunnel.HandleUDPPacket(inbound.NewPacket(target, packet, C.SOCKS5, additions...))
+	_, metadata := inbound.NewPacket(target, pkt, C.SOCKS5, additions...)
+	up := C.NewUDPPacket(pkt.Buffer, metadata, pkt.FlowKey(), pkt)
+	tunnel.HandleUDPPacket(up, metadata)
 }

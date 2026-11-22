@@ -10,8 +10,11 @@ import (
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/dialer"
+
+	"github.com/metacubex/sing/common/buf"
 )
 
 // Adapter Type
@@ -257,63 +260,45 @@ func (at AdapterType) String() string {
 	}
 }
 
-// UDPPacket contains the data of UDP packet, and offers control/info of UDP packet's source
-type UDPPacket interface {
-	// Data get the payload of UDP Packet
-	Data() []byte
+type UDPPacket struct {
+	Buffer *buf.Buffer
+	Meta   *Metadata
+	Flow   udpkey.FlowKey
+	WB     WriteBack
+}
 
-	// WriteBack writes the payload with source IP/Port equals addr
-	// - variable source IP/Port is important to STUN
-	// - if addr is not provided, WriteBack will write out UDP packet with SourceIP/Port equals to original Target,
-	//   this is important when using Fake-IP.
-	WriteBack
+func NewUDPPacket(b *buf.Buffer, meta *Metadata, flow udpkey.FlowKey, wb WriteBack) *UDPPacket {
+	return &UDPPacket{
+		Buffer: b,
+		Meta:   meta,
+		Flow:   flow,
+		WB:     wb,
+	}
+}
 
-	// Drop call after packet is used, could recycle buffer in this function.
-	Drop()
+func (p *UDPPacket) Data() []byte { return p.Buffer.Bytes() }
 
-	// LocalAddr returns the source IP/Port of packet
-	LocalAddr() net.Addr
+func (p *UDPPacket) Drop() { p.Buffer.Release() }
+
+func (p *UDPPacket) FlowKey() udpkey.FlowKey { return p.Flow }
+
+func (p *UDPPacket) InAddr() net.Addr { return net.UDPAddrFromAddrPort(p.Flow.Src) }
+
+func (p *UDPPacket) WriteBack(b *buf.Buffer, src netip.AddrPort) (n int, err error) {
+	return p.WB.WriteBack(b, src)
+}
+
+type UDPPacketPeer interface {
+	FlowKey() udpkey.FlowKey
+	WriteBack(b *buf.Buffer, src netip.AddrPort) (n int, err error)
 }
 
 type UDPPacketInAddr interface {
 	InAddr() net.Addr
 }
 
-// PacketAdapter is a UDP Packet adapter for socks/redir/tun
-type PacketAdapter interface {
-	UDPPacket
-	// Metadata returns destination metadata
-	Metadata() *Metadata
-	// Key is a SNAT key
-	Key() string
-}
-
-type packetAdapter struct {
-	UDPPacket
-	metadata *Metadata
-	key      string
-}
-
-// Metadata returns destination metadata
-func (s *packetAdapter) Metadata() *Metadata {
-	return s.metadata
-}
-
-// Key is a SNAT key
-func (s *packetAdapter) Key() string {
-	return s.key
-}
-
-func NewPacketAdapter(packet UDPPacket, metadata *Metadata) PacketAdapter {
-	return &packetAdapter{
-		packet,
-		metadata,
-		packet.LocalAddr().String(),
-	}
-}
-
 type WriteBack interface {
-	WriteBack(b []byte, addr net.Addr) (n int, err error)
+	WriteBack(b *buf.Buffer, src netip.AddrPort) (n int, err error)
 }
 
 type WriteBackProxy interface {
@@ -322,26 +307,18 @@ type WriteBackProxy interface {
 }
 
 type PacketSender interface {
-	// Send will send PacketAdapter nonblocking
-	// the implement must call UDPPacket.Drop() inside Send
-	Send(PacketAdapter)
-	// Process is a blocking loop to send PacketAdapter to PacketConn and update the WriteBackProxy
+	Send(*UDPPacket)
 	Process(PacketConn, WriteBackProxy)
-	// Close stop the Process loop
 	Close()
-	// DoSniff will blocking after sniffer work done
 	DoSniff(*Metadata) error
-	// AddMapping add a destination NAT record
 	AddMapping(originMetadata *Metadata, metadata *Metadata)
-	// RestoreReadFrom restore destination NAT for ReadFrom
-	// the implement must ensure returned netip.Add is valid (or just return input addr)
 	RestoreReadFrom(addr netip.Addr) netip.Addr
 }
 
 type NatTable interface {
-	GetOrCreate(key string, maker func() PacketSender) (PacketSender, bool)
+	GetOrCreate(key udpkey.FlowKey, maker func() PacketSender) (PacketSender, bool)
 
-	Delete(key string)
+	Delete(key udpkey.FlowKey)
 
 	GetForLocalConn(lAddr, rAddr string) *net.UDPConn
 

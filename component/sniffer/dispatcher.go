@@ -82,8 +82,8 @@ func (sd *Dispatcher) forceSniff(metadata *C.Metadata) bool {
 // UDPSniff is called when a UDP NAT is created and passed the first initialization packet.
 // It may return a wrapped packetSender if the sniffer process needs to wait for multiple packets.
 // This function must be non-blocking, and any blocking operations should be done in the wrapped packetSender.
-func (sd *Dispatcher) UDPSniff(packet C.PacketAdapter, packetSender C.PacketSender) C.PacketSender {
-	metadata := packet.Metadata()
+func (sd *Dispatcher) UDPSniff(packet *C.UDPPacket, packetSender C.PacketSender) C.PacketSender {
+	metadata := packet.Meta
 	if sd.shouldOverride(metadata) {
 		for _, current := range sd.sniffers {
 			if current.supportsNetwork(C.UDP) {
@@ -103,7 +103,7 @@ func (sd *Dispatcher) UDPSniff(packet C.PacketAdapter, packetSender C.PacketSend
 						return wrapable.WrapperSender(packetSender, replaceDomain)
 					}
 
-					host, err := current.SniffData(packet.Data())
+					host, err := current.SniffData(packet.Buffer.Bytes())
 					if err != nil {
 						continue
 					}

@@ -4,12 +4,14 @@ import (
 	"net"
 	"sync"
 
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	"github.com/metacubex/mihomo/common/xsync"
 	C "github.com/metacubex/mihomo/constant"
 )
 
 type Table struct {
-	mapping xsync.Map[string, *entry]
+	mapping        xsync.Map[udpkey.FlowKey, *entry]
+	localConnIndex xsync.Map[string, *entry]
 }
 
 type entry struct {
@@ -18,17 +20,20 @@ type entry struct {
 	LocalLockMap    xsync.Map[string, *sync.Cond]
 }
 
-func (t *Table) GetOrCreate(key string, maker func() C.PacketSender) (C.PacketSender, bool) {
+func (t *Table) GetOrCreate(key udpkey.FlowKey, maker func() C.PacketSender) (C.PacketSender, bool) {
 	item, loaded := t.mapping.LoadOrStoreFn(key, func() *entry {
-		return &entry{
+		e := &entry{
 			PacketSender: maker(),
 		}
+		t.localConnIndex.Store(key.Src.String(), e)
+		return e
 	})
 	return item.PacketSender, loaded
 }
 
-func (t *Table) Delete(key string) {
+func (t *Table) Delete(key udpkey.FlowKey) {
 	t.mapping.Delete(key)
+	t.localConnIndex.Delete(key.Src.String())
 }
 
 func (t *Table) GetForLocalConn(lAddr, rAddr string) *net.UDPConn {
@@ -86,7 +91,7 @@ func (t *Table) DeleteLockForLocalConn(lAddr, key string) {
 }
 
 func (t *Table) getEntry(key string) (*entry, bool) {
-	return t.mapping.Load(key)
+	return t.localConnIndex.Load(key)
 }
 
 func makeLock() *sync.Cond {

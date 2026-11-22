@@ -5,10 +5,11 @@ import (
 	"net/netip"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
-	"github.com/metacubex/mihomo/common/pool"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/socks5"
 
+	"github.com/metacubex/sing/common/buf"
 	"golang.org/x/exp/slices"
 )
 
@@ -16,6 +17,7 @@ type UDPListener struct {
 	packetConn net.PacketConn
 	addr       string
 	closed     bool
+	inboundID  uint32
 }
 
 // RawAddress implements C.Listener
@@ -49,6 +51,7 @@ func NewUDP(addr string, tunnel C.Tunnel, additions ...inbound.Addition) (*UDPLi
 	rl := &UDPListener{
 		packetConn: l,
 		addr:       addr,
+		inboundID:  udpkey.NextInbound(),
 	}
 
 	c := l.(*net.UDPConn)
@@ -66,10 +69,10 @@ func NewUDP(addr string, tunnel C.Tunnel, additions ...inbound.Addition) (*UDPLi
 	go func() {
 		oob := make([]byte, 1024)
 		for {
-			buf := pool.Get(pool.UDPBufferSize)
-			n, oobn, _, lAddr, err := c.ReadMsgUDPAddrPort(buf, oob)
+			b := buf.NewPacket()
+			n, oobn, _, lAddr, err := c.ReadMsgUDPAddrPort(b.FreeBytes(), oob)
 			if err != nil {
-				pool.Put(buf)
+				b.Release()
 				if rl.closed {
 					break
 				}
@@ -78,7 +81,7 @@ func NewUDP(addr string, tunnel C.Tunnel, additions ...inbound.Addition) (*UDPLi
 
 			rAddr, err := getOrigDst(oob[:oobn])
 			if err != nil {
-				pool.Put(buf)
+				b.Release()
 				continue
 			}
 
@@ -89,21 +92,25 @@ func NewUDP(addr string, tunnel C.Tunnel, additions ...inbound.Addition) (*UDPLi
 				// try to unmap 4in6 address
 				lAddr = netip.AddrPortFrom(lAddr.Addr().Unmap(), lAddr.Port())
 			}
-			handlePacketConn(l, tunnel, buf[:n], lAddr, rAddr, additions...)
+			b.Truncate(n)
+			handlePacketConn(l, tunnel, b, lAddr, rAddr, rl.inboundID, additions...)
 		}
 	}()
 
 	return rl, nil
 }
 
-func handlePacketConn(pc net.PacketConn, tunnel C.Tunnel, buf []byte, lAddr, rAddr netip.AddrPort, additions ...inbound.Addition) {
+func handlePacketConn(pc net.PacketConn, tunnel C.Tunnel, b *buf.Buffer, lAddr, rAddr netip.AddrPort, inboundID uint32, additions ...inbound.Addition) {
 	target := socks5.AddrFromStdAddrPort(rAddr)
 	pkt := &packet{
+		Buffer:    b,
 		pc:        pc,
 		lAddr:     lAddr,
-		buf:       buf,
 		tunnel:    tunnel,
 		additions: additions,
+		flowKey:   udpkey.Make(inboundID, lAddr),
 	}
-	tunnel.HandleUDPPacket(inbound.NewPacket(target, pkt, C.TPROXY, additions...))
+	_, metadata := inbound.NewPacket(target, pkt, C.TPROXY, additions...)
+	up := C.NewUDPPacket(pkt.Buffer, metadata, pkt.FlowKey(), pkt)
+	tunnel.HandleUDPPacket(up, metadata)
 }

@@ -3,18 +3,20 @@ package v4
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/common/xsync"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/socks5"
 	"github.com/metacubex/mihomo/transport/tuic/types"
+	"github.com/metacubex/sing/common/buf"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/metacubex/quic-go"
@@ -22,7 +24,7 @@ import (
 
 type ServerOption struct {
 	HandleTcpFn func(conn net.Conn, addr socks5.Addr, additions ...inbound.Addition) error
-	HandleUdpFn func(addr socks5.Addr, packet C.UDPPacket, additions ...inbound.Addition) error
+	HandleUdpFn func(addr socks5.Addr, packet C.UDPPacketPeer, additions ...inbound.Addition) error
 
 	Tokens                [][32]byte
 	MaxUdpRelayPacketSize int
@@ -32,7 +34,7 @@ func NewServerHandler(option *ServerOption, quicConn *quic.Conn, uuid uuid.UUID)
 	return &serverHandler{
 		ServerOption: option,
 		quicConn:     quicConn,
-		uuid:         uuid,
+		src:          quicConn.RemoteAddr().(interface{ AddrPort() netip.AddrPort }).AddrPort(),
 		authCh:       make(chan struct{}),
 	}
 }
@@ -40,13 +42,18 @@ func NewServerHandler(option *ServerOption, quicConn *quic.Conn, uuid uuid.UUID)
 type serverHandler struct {
 	*ServerOption
 	quicConn *quic.Conn
-	uuid     uuid.UUID
+	src      netip.AddrPort
 
 	authCh   chan struct{}
 	authOk   atomic.Bool
 	authOnce sync.Once
 
-	udpInputMap xsync.Map[uint32, *atomic.Bool]
+	udpInputMap xsync.Map[uint32, *serverUDPInput]
+}
+
+type serverUDPInput struct {
+	writeClosed atomic.Bool
+	inboundID   uint32
 }
 
 func (s *serverHandler) AuthOk() bool {
@@ -79,8 +86,10 @@ func (s *serverHandler) parsePacket(packet *Packet, udpRelayMode types.UdpRelayM
 
 	assocId = packet.ASSOC_ID
 
-	writeClosed, _ := s.udpInputMap.LoadOrStoreFn(assocId, func() *atomic.Bool { return &atomic.Bool{} })
-	if writeClosed.Load() {
+	input, _ := s.udpInputMap.LoadOrStoreFn(assocId, func() *serverUDPInput {
+		return &serverUDPInput{inboundID: udpkey.NextInbound()}
+	})
+	if input.writeClosed.Load() {
 		return nil
 	}
 
@@ -92,13 +101,18 @@ func (s *serverHandler) parsePacket(packet *Packet, udpRelayMode types.UdpRelayM
 		maxUdpRelayPacketSize: s.MaxUdpRelayPacketSize,
 		deferQuicConnFn:       nil,
 		closeDeferFn:          nil,
-		writeClosed:           writeClosed,
+		writeClosed:           &input.writeClosed,
 	}
 
+	buff := buf.NewPacket()
+	if _, err := buff.Write(packet.DATA); err != nil {
+		buff.Release()
+		return err
+	}
 	return s.HandleUdpFn(packet.ADDR.SocksAddr(), &serverUDPPacket{
-		pc:     pc,
-		packet: packet,
-		rAddr:  N.NewCustomAddr("tuic", fmt.Sprintf("tuic-%s-%d", s.uuid, assocId), s.quicConn.RemoteAddr()), // for tunnel's handleUDPConn
+		pc:      pc,
+		buff:    buff,
+		flowKey: udpkey.Make(input.inboundID, s.src),
 	})
 }
 
@@ -174,8 +188,8 @@ func (s *serverHandler) HandleUniStream(reader *bufio.Reader) (err error) {
 		if err != nil {
 			return
 		}
-		if writeClosed, loaded := s.udpInputMap.LoadAndDelete(disassociate.ASSOC_ID); loaded {
-			writeClosed.Store(true)
+		if input, loaded := s.udpInputMap.LoadAndDelete(disassociate.ASSOC_ID); loaded {
+			input.writeClosed.Store(true)
 		}
 	case HeartbeatType:
 		var heartbeat Heartbeat
@@ -189,30 +203,21 @@ func (s *serverHandler) HandleUniStream(reader *bufio.Reader) (err error) {
 }
 
 type serverUDPPacket struct {
-	pc     *quicStreamPacketConn
-	packet *Packet
-	rAddr  net.Addr
+	pc      *quicStreamPacketConn
+	buff    *buf.Buffer
+	flowKey udpkey.FlowKey
 }
 
-func (s *serverUDPPacket) InAddr() net.Addr {
-	return s.pc.LocalAddr()
+func (s *serverUDPPacket) FlowKey() udpkey.FlowKey {
+	return s.flowKey
 }
 
-func (s *serverUDPPacket) LocalAddr() net.Addr {
-	return s.rAddr
+func (s *serverUDPPacket) Buffer() *buf.Buffer {
+	return s.buff
 }
 
-func (s *serverUDPPacket) Data() []byte {
-	return s.packet.DATA
+func (s *serverUDPPacket) WriteBack(b *buf.Buffer, src netip.AddrPort) (n int, err error) {
+	return s.pc.WriteTo(b.Bytes(), net.UDPAddrFromAddrPort(src))
 }
 
-func (s *serverUDPPacket) WriteBack(b []byte, addr net.Addr) (n int, err error) {
-	return s.pc.WriteTo(b, addr)
-}
-
-func (s *serverUDPPacket) Drop() {
-	s.packet.DATA = nil
-}
-
-var _ C.UDPPacket = (*serverUDPPacket)(nil)
-var _ C.UDPPacketInAddr = (*serverUDPPacket)(nil)
+var _ C.UDPPacketPeer = (*serverUDPPacket)(nil)

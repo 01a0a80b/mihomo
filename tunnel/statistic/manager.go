@@ -11,6 +11,33 @@ import (
 
 var DefaultManager *Manager
 
+type EffectStats struct {
+	UDPDroppedWorker uint64  `json:"udpDroppedWorker"`
+	UDPDroppedSender uint64  `json:"udpDroppedSender"`
+	UDPBatchPackets  uint64  `json:"udpBatchPackets"`
+	UDPBatchCalls    uint64  `json:"udpBatchCalls"`
+	UDPDropRate      float64 `json:"udpDropRate"`
+}
+
+type udpMetricsSampler func() (uint64, uint64, uint64, uint64)
+
+var (
+	udpSampler  atomic.TypedValue[udpMetricsSampler]
+	effectStats atomic.TypedValue[EffectStats]
+)
+
+func SetUDPMetricsSampler(f udpMetricsSampler) {
+	udpSampler.Store(f)
+}
+
+func GetEffectStats() EffectStats {
+	return effectStats.Load()
+}
+
+func (m *Manager) EffectStats() EffectStats {
+	return effectStats.Load()
+}
+
 func init() {
 	DefaultManager = &Manager{
 		uploadTemp:    atomic.NewInt64(0),
@@ -118,6 +145,22 @@ func (m *Manager) handle() {
 	for range ticker.C {
 		m.uploadBlip.Store(m.uploadTemp.Swap(0))
 		m.downloadBlip.Store(m.downloadTemp.Swap(0))
+		if sampler, ok := udpSampler.LoadOk(); ok {
+			droppedWorker, droppedSender, batchPackets, batchCalls := sampler()
+			dropped := droppedWorker + droppedSender
+			total := batchPackets + dropped
+			var dropRate float64
+			if total > 0 {
+				dropRate = float64(dropped) / float64(total)
+			}
+			effectStats.Store(EffectStats{
+				UDPDroppedWorker: droppedWorker,
+				UDPDroppedSender: droppedSender,
+				UDPBatchPackets:  batchPackets,
+				UDPBatchCalls:    batchCalls,
+				UDPDropRate:      dropRate,
+			})
+		}
 	}
 }
 

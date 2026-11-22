@@ -44,6 +44,12 @@ import (
 	"golang.org/x/exp/slices"
 )
 
+const (
+	defaultUDPWorkerCount  = 0
+	defaultUDPQueueSize    = 64
+	defaultUDPDropStrategy = "drop"
+)
+
 // General config
 type General struct {
 	Inbound
@@ -125,6 +131,12 @@ type Experimental struct {
 	IP4PEnable       bool
 }
 
+type UDP struct {
+	WorkerCount  int    `json:"worker-count"`
+	QueueSize    int    `json:"queue-size"`
+	DropStrategy string `json:"drop-strategy"`
+}
+
 // IPTables config
 type IPTables struct {
 	Enable           bool
@@ -196,6 +208,7 @@ type Config struct {
 	General       *General
 	Controller    *Controller
 	Experimental  *Experimental
+	UDP           *UDP
 	IPTables      *IPTables
 	NTP           *NTP
 	DNS           *DNS
@@ -448,6 +461,9 @@ type RawConfig struct {
 	KeepAliveIdle                 int                     `yaml:"keep-alive-idle" json:"keep-alive-idle"`
 	KeepAliveInterval             int                     `yaml:"keep-alive-interval" json:"keep-alive-interval"`
 	DisableKeepAlive              bool                    `yaml:"disable-keep-alive" json:"disable-keep-alive"`
+	UDPWorkerCount                int                     `yaml:"udp-worker-count" json:"udp-worker-count"`
+	UDPQueueSize                  int                     `yaml:"udp-queue-size" json:"udp-queue-size"`
+	UDPDropStrategy               string                  `yaml:"udp-drop-strategy" json:"udp-drop-strategy"`
 
 	ProxyProvider map[string]map[string]any `yaml:"proxy-providers" json:"proxy-providers"`
 	RuleProvider  map[string]map[string]any `yaml:"rule-providers" json:"rule-providers"`
@@ -503,6 +519,9 @@ func DefaultRawConfig() *RawConfig {
 		FindProcessMode:   process.FindProcessStrict,
 		GlobalUA:          "clash.meta/" + C.Version,
 		ETagSupport:       true,
+		UDPWorkerCount:    defaultUDPWorkerCount,
+		UDPQueueSize:      defaultUDPQueueSize,
+		UDPDropStrategy:   defaultUDPDropStrategy,
 		DNS: RawDNS{
 			Enable:         false,
 			IPv6:           false,
@@ -650,6 +669,12 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 		return nil, err
 	}
 	config.Experimental = experimental
+
+	udp, err := parseUDP(rawCfg)
+	if err != nil {
+		return nil, err
+	}
+	config.UDP = udp
 
 	iptables, err := parseIPTables(rawCfg)
 	if err != nil {
@@ -836,6 +861,26 @@ func parseExperimental(cfg *RawConfig) (*Experimental, error) {
 		QUICGoDisableGSO: cfg.Experimental.QUICGoDisableGSO,
 		QUICGoDisableECN: cfg.Experimental.QUICGoDisableECN,
 		IP4PEnable:       cfg.Experimental.IP4PEnable,
+	}, nil
+}
+
+func parseUDP(cfg *RawConfig) (*UDP, error) {
+	workerCount := cfg.UDPWorkerCount
+	if workerCount < 0 {
+		workerCount = defaultUDPWorkerCount
+	}
+	queueSize := cfg.UDPQueueSize
+	if queueSize <= 0 {
+		queueSize = defaultUDPQueueSize
+	}
+	dropStrategy := cfg.UDPDropStrategy
+	if dropStrategy != "drop" && dropStrategy != "block" {
+		dropStrategy = defaultUDPDropStrategy
+	}
+	return &UDP{
+		WorkerCount:  workerCount,
+		QueueSize:    queueSize,
+		DropStrategy: dropStrategy,
 	}, nil
 }
 

@@ -6,13 +6,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	"github.com/metacubex/mihomo/common/pool"
-	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/inner"
@@ -20,6 +21,8 @@ import (
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/socks5"
 	"github.com/metacubex/mihomo/transport/sudoku"
+
+	"github.com/metacubex/sing/common/buf"
 )
 
 type Listener struct {
@@ -171,7 +174,8 @@ func (l *Listener) handleUoTSession(conn net.Conn, tunnel C.Tunnel, additions ..
 	writer := sudoku.NewUoTPacketConn(conn)
 	reader := sudoku.NewUoTReader(conn)
 	remoteAddr := conn.RemoteAddr()
-	connID := utils.NewUUIDV4().String() // make a new SNAT key
+	src := remoteAddr.(interface{ AddrPort() netip.AddrPort }).AddrPort()
+	inboundID := udpkey.NextInbound()
 
 	for {
 		target, payload, err := reader.ReadDatagram()
@@ -182,38 +186,33 @@ func (l *Listener) handleUoTSession(conn net.Conn, tunnel C.Tunnel, additions ..
 			_ = conn.Close()
 			return
 		}
-
-		cPacket := &uotPacket{
-			payload: payload,
+		b := buf.NewPacket()
+		b.Write(payload)
+		_ = pool.Put(payload)
+		flow := udpkey.Make(inboundID, src)
+		pkt := &uotPacket{
+			Buffer:  b,
 			writer:  writer,
-			rAddr:   remoteAddr,
+			flowKey: flow,
 		}
-		cPacket.rAddr = N.NewCustomAddr(C.SUDOKU.String(), connID, cPacket.rAddr) // for tunnel's handleUDPConn
-		tunnel.HandleUDPPacket(inbound.NewPacket(target, cPacket, C.SUDOKU, additions...))
+		_, metadata := inbound.NewPacket(target, pkt, C.SUDOKU, additions...)
+		up := C.NewUDPPacket(pkt.Buffer, metadata, flow, pkt)
+		tunnel.HandleUDPPacket(up, metadata)
 	}
 }
 
 type uotPacket struct {
-	payload []byte
+	Buffer  *buf.Buffer
 	writer  *sudoku.UoTPacketConn
-	rAddr   net.Addr
+	flowKey udpkey.FlowKey
 }
 
-func (p *uotPacket) Data() []byte {
-	return p.payload
+func (p *uotPacket) FlowKey() udpkey.FlowKey {
+	return p.flowKey
 }
 
-func (p *uotPacket) WriteBack(b []byte, addr net.Addr) (int, error) {
-	return p.writer.WriteTo(b, addr)
-}
-
-func (p *uotPacket) Drop() {
-	_ = pool.Put(p.payload)
-	p.payload = nil
-}
-
-func (p *uotPacket) LocalAddr() net.Addr {
-	return p.rAddr
+func (p *uotPacket) WriteBack(b *buf.Buffer, src netip.AddrPort) (int, error) {
+	return p.writer.WriteTo(b.Bytes(), net.UDPAddrFromAddrPort(src))
 }
 
 func relayToFallback(wrapper net.Conn, rawConn net.Conn, fallback net.Conn) {

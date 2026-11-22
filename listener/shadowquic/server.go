@@ -24,9 +24,14 @@ import (
 
 	"github.com/metacubex/jls-quic-go"
 	"github.com/metacubex/jls-tls"
+	"github.com/metacubex/sing/common/buf"
 )
 
 const ServerMaxIncomingStreams = (1 << 32) - 1
+
+type udpBufferPeer interface {
+	Buffer() *buf.Buffer
+}
 
 type Listener struct {
 	closed       bool
@@ -142,12 +147,18 @@ func New(config LC.ShadowQuicServer, lc C.InboundListenConfig, tunnel C.Tunnel, 
 		go h.HandleSocket(addr, conn, _additions...)
 		return nil
 	}
-	handleUdpFn := func(addr socks5.Addr, packet C.UDPPacket, _additions ...inbound.Addition) error {
+	handleUdpFn := func(addr socks5.Addr, packet C.UDPPacketPeer, _additions ...inbound.Addition) error {
 		newAdditions := additions
 		if len(_additions) > 0 {
 			newAdditions = append(append([]inbound.Addition{}, additions...), _additions...)
 		}
-		tunnel.HandleUDPPacket(inbound.NewPacket(addr, packet, C.SHADOWQUIC, newAdditions...))
+		peer, ok := packet.(udpBufferPeer)
+		if !ok {
+			return errors.New("shadowquic: udp packet missing buffer")
+		}
+		_, metadata := inbound.NewPacket(addr, packet, C.SHADOWQUIC, newAdditions...)
+		up := C.NewUDPPacket(peer.Buffer(), metadata, packet.FlowKey(), packet)
+		tunnel.HandleUDPPacket(up, metadata)
 		return nil
 	}
 

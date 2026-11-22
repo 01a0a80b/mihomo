@@ -3,21 +3,22 @@ package shadowquic
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
+	"net/netip"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
-	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/socks5"
 
 	"github.com/metacubex/jls-quic-go"
 	"github.com/metacubex/jls-tls"
+	"github.com/metacubex/sing/common/buf"
 )
 
 type ServerOption struct {
 	HandleTcpFn func(conn net.Conn, addr socks5.Addr, additions ...inbound.Addition) error
-	HandleUdpFn func(addr socks5.Addr, packet C.UDPPacket, additions ...inbound.Addition) error
+	HandleUdpFn func(addr socks5.Addr, packet C.UDPPacketPeer, additions ...inbound.Addition) error
 
 	TLSConfig  *tls.Config
 	QUICConfig *quic.Config
@@ -185,15 +186,22 @@ func (s *Server) handleExtension(state *connState, conn net.Conn) {
 }
 
 func (s *Server) handleAssociation(assoc *association) {
-	rAddr := N.NewCustomAddr("shadowquic", fmt.Sprintf("shadowquic-%p", assoc), assoc.parent.quicConn.RemoteAddr())
+	rAddr := assoc.parent.quicConn.RemoteAddr()
+	src := rAddr.(interface{ AddrPort() netip.AddrPort }).AddrPort()
+	inboundID := udpkey.NextInbound()
 	additions := s.jlsAdditions(assoc.parent)
 	for {
 		select {
 		case packet := <-assoc.input:
+			buff := buf.NewPacket()
+			if _, err := buff.Write(packet.data); err != nil {
+				buff.Release()
+				continue
+			}
 			s.option.HandleUdpFn(packet.socksAddr, &serverUDPPacket{
-				assoc: assoc,
-				data:  packet.data,
-				rAddr: rAddr,
+				assoc:   assoc,
+				buff:    buff,
+				flowKey: udpkey.Make(inboundID, src),
 			}, additions...)
 		case <-assoc.closed:
 			return
@@ -217,30 +225,21 @@ func (s *Server) jlsUser(state *connState) string {
 }
 
 type serverUDPPacket struct {
-	assoc *association
-	data  []byte
-	rAddr net.Addr
+	assoc   *association
+	buff    *buf.Buffer
+	flowKey udpkey.FlowKey
 }
 
-func (p *serverUDPPacket) Data() []byte {
-	return p.data
+func (p *serverUDPPacket) FlowKey() udpkey.FlowKey {
+	return p.flowKey
 }
 
-func (p *serverUDPPacket) WriteBack(b []byte, addr net.Addr) (int, error) {
-	return p.assoc.WriteTo(b, addr)
+func (p *serverUDPPacket) Buffer() *buf.Buffer {
+	return p.buff
 }
 
-func (p *serverUDPPacket) Drop() {
-	p.data = nil
+func (p *serverUDPPacket) WriteBack(b *buf.Buffer, src netip.AddrPort) (int, error) {
+	return p.assoc.WriteTo(b.Bytes(), net.UDPAddrFromAddrPort(src))
 }
 
-func (p *serverUDPPacket) LocalAddr() net.Addr {
-	return p.rAddr
-}
-
-func (p *serverUDPPacket) InAddr() net.Addr {
-	return p.assoc.LocalAddr()
-}
-
-var _ C.UDPPacket = (*serverUDPPacket)(nil)
-var _ C.UDPPacketInAddr = (*serverUDPPacket)(nil)
+var _ C.UDPPacketPeer = (*serverUDPPacket)(nil)

@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -23,6 +24,13 @@ type NetPacketConn struct {
 	disablePipe  atomic.Bool
 	inRead       atomic.Bool
 	resultCh     chan any
+
+	readerOnce  sync.Once
+	readerStop  chan struct{}
+	readerDone  chan struct{}
+	readerStart atomic.Bool
+	stopOnce    sync.Once
+	closed      atomic.Bool
 }
 
 func NewNetPacketConn(pc net.PacketConn) net.PacketConn {
@@ -63,8 +71,62 @@ func NewNetPacketConn(pc net.PacketConn) net.PacketConn {
 	return npc
 }
 
+func (c *NetPacketConn) startReader() {
+	c.readerOnce.Do(func() {
+		c.readerStop = make(chan struct{})
+		c.readerDone = make(chan struct{})
+		c.readerStart.Store(true)
+		go c.readLoop()
+	})
+}
+
+func (c *NetPacketConn) readLoop() {
+	defer close(c.readerDone)
+	buffer := make([]byte, 1<<16)
+	result := &readResult{}
+	for {
+	FOR:
+		for {
+			select {
+			case cached := <-c.resultCh:
+				if cached != nil {
+					c.resultCh <- cached
+					runtime.Gosched()
+					continue FOR
+				}
+				break FOR
+			case <-c.readerStop:
+				return
+			}
+		}
+		n, addr, err := c.PacketConn.ReadFrom(buffer)
+		result.data = buffer[:n]
+		result.addr = addr
+		result.err = err
+		select {
+		case c.resultCh <- result:
+		case <-c.readerStop:
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
 func (c *NetPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-FOR:
+	if c.closed.Load() {
+		return 0, nil, net.ErrClosed
+	}
+	if c.disablePipe.Load() {
+		return c.PacketConn.ReadFrom(p)
+	}
+	if c.deadline.Load().IsZero() && !c.readerStart.Load() {
+		c.inRead.Store(true)
+		defer c.inRead.Store(false)
+		return c.PacketConn.ReadFrom(p)
+	}
+	c.startReader()
 	for {
 		select {
 		case result := <-c.resultCh:
@@ -73,45 +135,32 @@ FOR:
 					n = copy(p, result.data)
 					addr = result.addr
 					err = result.err
-					c.resultCh <- nil // finish cache read
+					c.resultCh <- nil
 					return
 				}
-				c.resultCh <- result // another type of read
-				runtime.Gosched()    // allowing other goroutines to run
-				continue FOR
+				c.resultCh <- result
+				runtime.Gosched()
 			} else {
 				c.resultCh <- nil
-				break FOR
 			}
 		case <-c.pipeDeadline.Wait():
 			return 0, nil, os.ErrDeadlineExceeded
+		case <-c.readerStop:
+			return 0, nil, net.ErrClosed
 		}
 	}
-
-	if c.disablePipe.Load() {
-		return c.PacketConn.ReadFrom(p)
-	} else if c.deadline.Load().IsZero() {
-		c.inRead.Store(true)
-		defer c.inRead.Store(false)
-		n, addr, err = c.PacketConn.ReadFrom(p)
-		return
-	}
-
-	<-c.resultCh
-	go c.pipeReadFrom(len(p))
-
-	return c.ReadFrom(p)
 }
 
-func (c *NetPacketConn) pipeReadFrom(size int) {
-	buffer := make([]byte, size)
-	n, addr, err := c.PacketConn.ReadFrom(buffer)
-	buffer = buffer[:n]
-	result := &readResult{}
-	result.data = buffer
-	result.addr = addr
-	result.err = err
-	c.resultCh <- result
+func (c *NetPacketConn) Close() error {
+	c.closed.Store(true)
+	err := c.PacketConn.Close()
+	if c.readerStart.Load() {
+		c.stopOnce.Do(func() {
+			close(c.readerStop)
+			<-c.readerDone
+		})
+	}
+	return err
 }
 
 func (c *NetPacketConn) SetReadDeadline(t time.Time) error {

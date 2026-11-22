@@ -33,14 +33,15 @@ import (
 )
 
 const (
-	queueCapacity  = 64  // chan capacity tcpQueue and udpQueue
-	senderCapacity = 128 // chan capacity of PacketSender
+	queueCapacity        = 64  // chan capacity tcpQueue and udpQueue
+	senderCapacity       = 128 // chan capacity of PacketSender
+	udpQueueBlockTimeout = 100 * time.Millisecond
 )
 
 var (
 	status        = atomic.NewInt32Enum(Suspend)
 	udpInit       sync.Once
-	udpQueues     []chan C.PacketAdapter
+	udpQueues     []chan *C.UDPPacket
 	natTable      = nat.New()
 	rules         []C.Rule
 	listeners     = make(map[string]C.InboundListener)
@@ -53,7 +54,7 @@ var (
 	// for compatibility, lazy init
 	tcpQueue  chan C.ConnContext
 	tcpInOnce sync.Once
-	udpQueue  chan C.PacketAdapter
+	udpQueue  chan *C.UDPPacket
 	udpInOnce sync.Once
 
 	// Outbound Rule
@@ -61,6 +62,10 @@ var (
 
 	// default timeout for UDP session
 	udpTimeout = 60 * time.Second
+
+	udpWorkerCount  = 0
+	udpQueueSize    = queueCapacity
+	udpDropStrategy = "drop"
 
 	findProcessMode = atomic.NewInt32Enum(process.FindProcessStrict)
 
@@ -77,37 +82,73 @@ var _ C.Tunnel = Tunnel
 var _ P.Tunnel = Tunnel
 var _ proxydialer.Tunnel = Tunnel
 
+func init() {
+	statistic.SetUDPMetricsSampler(func() (uint64, uint64, uint64, uint64) {
+		s := SnapshotUDPMetrics()
+		return s.DroppedWorker, s.DroppedSender, s.BatchPackets, s.BatchCalls
+	})
+}
+
+func UpdateUDPConfig(workerCount, queueSize int, dropStrategy string) {
+	udpWorkerCount = workerCount
+	if queueSize <= 0 {
+		queueSize = queueCapacity
+	}
+	udpQueueSize = queueSize
+	if dropStrategy != "drop" && dropStrategy != "block" {
+		dropStrategy = "drop"
+	}
+	udpDropStrategy = dropStrategy
+}
+
 func (t tunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
 	connCtx := icontext.NewConnContext(conn, metadata)
 	handleTCPConn(connCtx)
 }
 
 func initUDP() {
-	numUDPWorkers := 4
-	if num := runtime.GOMAXPROCS(0); num > numUDPWorkers {
-		numUDPWorkers = num
+	numUDPWorkers := udpWorkerCount
+	if numUDPWorkers <= 0 {
+		numUDPWorkers = 4
+		if num := runtime.GOMAXPROCS(0); num > numUDPWorkers {
+			numUDPWorkers = num
+		}
+		if numUDPWorkers > 16 {
+			numUDPWorkers = 16
+		}
 	}
 
-	udpQueues = make([]chan C.PacketAdapter, numUDPWorkers)
+	udpQueues = make([]chan *C.UDPPacket, numUDPWorkers)
 	for i := 0; i < numUDPWorkers; i++ {
-		queue := make(chan C.PacketAdapter, queueCapacity)
+		queue := make(chan *C.UDPPacket, udpQueueSize)
 		udpQueues[i] = queue
 		go processUDP(queue)
 	}
 }
 
-func (t tunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
+func (t tunnel) HandleUDPPacket(packet *C.UDPPacket, metadata *C.Metadata) {
 	udpInit.Do(initUDP)
 
-	packetAdapter := C.NewPacketAdapter(packet, metadata)
-	key := packetAdapter.Key()
+	key := packet.FlowKey()
+	queueNo := key.Hash() % uint64(len(udpQueues))
+	queue := udpQueues[queueNo]
 
-	hash := utils.MapHash(key)
-	queueNo := uint(hash) % uint(len(udpQueues))
+	if udpDropStrategy == "block" {
+		timer := time.NewTimer(udpQueueBlockTimeout)
+		defer timer.Stop()
+		select {
+		case queue <- packet:
+		case <-timer.C:
+			AddDroppedWorker(1)
+			packet.Drop()
+		}
+		return
+	}
 
 	select {
-	case udpQueues[queueNo] <- packetAdapter:
+	case queue <- packet:
 	default:
+		AddDroppedWorker(1)
 		packet.Drop()
 	}
 }
@@ -176,12 +217,12 @@ func TCPIn() chan<- C.ConnContext {
 
 // UDPIn return fan-in udp queue
 // Deprecated: using Tunnel instead
-func UDPIn() chan<- C.PacketAdapter {
+func UDPIn() chan<- *C.UDPPacket {
 	udpInOnce.Do(func() {
-		udpQueue = make(chan C.PacketAdapter, queueCapacity)
+		udpQueue = make(chan *C.UDPPacket, queueCapacity)
 		go func() {
 			for packet := range udpQueue {
-				Tunnel.HandleUDPPacket(packet, packet.Metadata())
+				Tunnel.HandleUDPPacket(packet, packet.Meta)
 			}
 		}()
 	})
@@ -418,33 +459,34 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 }
 
 // processUDP starts a loop to handle udp packet
-func processUDP(queue chan C.PacketAdapter) {
+func processUDP(queue chan *C.UDPPacket) {
 	for conn := range queue {
 		handleUDPConn(conn)
 	}
 }
 
-func handleUDPConn(packet C.PacketAdapter) {
-	if !isHandle(packet.Metadata().Type) {
+func handleUDPConn(packet *C.UDPPacket) {
+	if !isHandle(packet.Meta.Type) {
 		packet.Drop()
 		return
 	}
 
-	metadata := packet.Metadata()
+	metadata := packet.Meta
 	if !metadata.Valid() {
 		packet.Drop()
 		log.Warnln("[Metadata] not valid: %#v", metadata)
 		return
 	}
-	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
+	fixMetadata(metadata)
 
-	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
-		packet.Drop()
+	precheck := *metadata
+	if err := preHandleMetadata(&precheck); err != nil {
 		log.Debugln("[Metadata PreHandle] error: %s", err)
 		return
 	}
 
-	key := packet.Key()
+	key := packet.FlowKey()
+	lAddr := packet.Flow.Src.String()
 	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
 		sender := newPacketSender()
 		if sniffingEnable && snifferDispatcher.Enable() {
@@ -454,15 +496,15 @@ func handleUDPConn(packet C.PacketAdapter) {
 	})
 	if !loaded {
 		dial := func() (C.PacketConn, C.WriteBackProxy, error) {
-			originMetadata := metadata  // save origin metadata
-			metadata = metadata.Clone() // don't modify PacketAdapter's metadata
+			originMetadata := metadata
+			metadata = metadata.Clone()
 
 			if err := sender.DoSniff(metadata); err != nil {
 				log.Warnln("[UDP] DoSniff error: %s", err.Error())
 				return nil, nil, err
 			}
 
-			_ = preHandleMetadata(metadata) // error was pre-checked
+			_ = preHandleMetadata(metadata)
 
 			proxy, rule, err := resolveMetadata(metadata)
 			if err != nil {
@@ -489,7 +531,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			oAddrPort := dialMetadata.AddrPort()
 			writeBackProxy := nat.NewWriteBackProxy(packet)
 
-			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
+			go handleUDPToLocal(writeBackProxy, pc, sender, key, lAddr, oAddrPort)
 			return pc, writeBackProxy, nil
 		}
 
@@ -503,7 +545,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			sender.Process(pc, proxy)
 		}()
 	}
-	sender.Send(packet) // nonblocking
+	sender.Send(packet)
 }
 
 func handleTCPConn(connCtx C.ConnContext) {

@@ -13,8 +13,7 @@ import (
 	"sync"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
-	N "github.com/metacubex/mihomo/common/net"
-	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/jls"
@@ -23,6 +22,8 @@ import (
 	"github.com/metacubex/mihomo/transport/shadowsocks/shadowaead"
 	obfs "github.com/metacubex/mihomo/transport/simple-obfs"
 	"github.com/metacubex/mihomo/transport/snell"
+
+	"github.com/metacubex/sing/common/buf"
 )
 
 const maxPacketLength = 0x3fff
@@ -283,19 +284,20 @@ func (l *Listener) handleUDP(stream *snell.Snell, clientID string, tunnel C.Tunn
 		return err
 	}
 
-	connID := utils.NewUUIDV4().String()
-	localAddr := N.NewCustomAddr(C.SNELL.String(), connID, stream.RemoteAddr())
+	rAddr := stream.RemoteAddr()
+	src := rAddr.(interface{ AddrPort() netip.AddrPort }).AddrPort()
+	inboundID := udpkey.NextInbound()
 	writeMu := &sync.Mutex{}
-	buf := make([]byte, maxPacketLength)
+	readBuf := make([]byte, maxPacketLength)
 	for {
-		n, err := stream.Read(buf)
+		n, err := stream.Read(readBuf)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, shadowaead.ErrZeroChunk) {
 				return nil
 			}
 			return err
 		}
-		request, err := snell.ParseUDPRequest(buf[:n])
+		request, err := snell.ParseUDPRequest(readBuf[:n])
 		if err != nil {
 			return err
 		}
@@ -305,15 +307,18 @@ func (l *Listener) handleUDP(stream *snell.Snell, clientID string, tunnel C.Tunn
 			metadata.DstIP = request.Ip
 		}
 
-		payload := append([]byte(nil), request.Payload...)
-		packet := &udpPacket{
-			data:      payload,
-			conn:      stream,
-			writeMu:   writeMu,
-			localAddr: localAddr,
-			dstAddr:   metadata.UDPAddr(),
+		b := buf.NewPacket()
+		b.Write(request.Payload)
+		flow := udpkey.Make(inboundID, src)
+		pkt := &udpPacket{
+			Buffer:  b,
+			conn:    stream,
+			writeMu: writeMu,
+			dstAddr: metadata.UDPAddr(),
+			flowKey: flow,
 		}
-		tunnel.HandleUDPPacket(packet, metadata)
+		up := C.NewUDPPacket(pkt.Buffer, metadata, flow, pkt)
+		tunnel.HandleUDPPacket(up, metadata)
 	}
 }
 
@@ -409,33 +414,25 @@ func (c *tcpRequestConn) Close() error {
 }
 
 type udpPacket struct {
-	data      []byte
-	conn      *snell.Snell
-	writeMu   *sync.Mutex
-	localAddr net.Addr
-	dstAddr   net.Addr
+	Buffer  *buf.Buffer
+	conn    *snell.Snell
+	writeMu *sync.Mutex
+	dstAddr net.Addr
+	flowKey udpkey.FlowKey
 }
 
-func (p *udpPacket) Data() []byte {
-	return p.data
+func (p *udpPacket) FlowKey() udpkey.FlowKey {
+	return p.flowKey
 }
 
-func (p *udpPacket) WriteBack(b []byte, addr net.Addr) (int, error) {
-	if addr == nil {
-		addr = p.dstAddr
+func (p *udpPacket) WriteBack(b *buf.Buffer, src netip.AddrPort) (int, error) {
+	addr := p.dstAddr
+	if src.IsValid() {
+		addr = net.UDPAddrFromAddrPort(src)
 	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
-	return snell.WritePacketResponse(p.conn, addr, b)
-}
-
-func (p *udpPacket) Drop() {
-	p.data = nil
-}
-
-func (p *udpPacket) LocalAddr() net.Addr {
-	return p.localAddr
+	return snell.WritePacketResponse(p.conn, addr, b.Bytes())
 }
 
 var _ C.MultiAddrListener = (*Listener)(nil)
-var _ C.UDPPacket = (*udpPacket)(nil)

@@ -9,46 +9,65 @@ import (
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/net/udp/batch"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/sing/common/buf"
 )
 
 type packetSender struct {
 	ctx    context.Context
 	cancel context.CancelFunc
-	ch     chan C.PacketAdapter
+	ch     chan *C.UDPPacket
+	writer batch.Writer
 
-	// destination NAT mapping
-	originToTarget map[string]netip.Addr
+	originToTarget map[netip.Addr]netip.Addr
 	targetToOrigin map[netip.Addr]netip.Addr
 	mappingMutex   sync.RWMutex
+
+	writeAddr   net.UDPAddr
+	writeAddrIP [16]byte
 }
 
-// newPacketSender return a chan based C.PacketSender
-// It ensures that packets can be sent sequentially and without blocking
 func newPacketSender() C.PacketSender {
 	ctx, cancel := context.WithCancel(context.Background())
-	ch := make(chan C.PacketAdapter, senderCapacity)
+	ch := make(chan *C.UDPPacket, senderCapacity)
 	return &packetSender{
-		ctx:    ctx,
-		cancel: cancel,
-		ch:     ch,
-
-		originToTarget: make(map[string]netip.Addr),
+		ctx:            ctx,
+		cancel:         cancel,
+		ch:             ch,
+		originToTarget: make(map[netip.Addr]netip.Addr),
 		targetToOrigin: make(map[netip.Addr]netip.Addr),
 	}
+}
+
+func (s *packetSender) setWriteAddr(ap netip.AddrPort) *net.UDPAddr {
+	a := ap.Addr()
+	if a.Is4() {
+		ip := a.As4()
+		copy(s.writeAddrIP[:4], ip[:])
+		s.writeAddr.IP = s.writeAddrIP[:4]
+	} else {
+		ip := a.As16()
+		copy(s.writeAddrIP[:], ip[:])
+		s.writeAddr.IP = s.writeAddrIP[:]
+	}
+	s.writeAddr.Port = int(ap.Port())
+	s.writeAddr.Zone = a.Zone()
+	return &s.writeAddr
 }
 
 func (s *packetSender) AddMapping(originMetadata *C.Metadata, metadata *C.Metadata) {
 	s.mappingMutex.Lock()
 	defer s.mappingMutex.Unlock()
-	originKey := originMetadata.String()
-	originAddr := originMetadata.DstIP
-	targetAddr := metadata.DstIP
-	if addr := s.originToTarget[originKey]; !addr.IsValid() { // overwrite only if the record is illegal
+	originKey := originMetadata.DstIP.Unmap()
+	originAddr := originMetadata.DstIP.Unmap()
+	targetAddr := metadata.DstIP.Unmap()
+	if addr := s.originToTarget[originKey]; !addr.IsValid() {
 		s.originToTarget[originKey] = targetAddr
 	}
-	if addr := s.targetToOrigin[targetAddr]; !addr.IsValid() { // overwrite only if the record is illegal
+	if addr := s.targetToOrigin[targetAddr]; !addr.IsValid() {
 		s.targetToOrigin[targetAddr] = originAddr
 	}
 }
@@ -62,50 +81,49 @@ func (s *packetSender) RestoreReadFrom(addr netip.Addr) netip.Addr {
 	return addr
 }
 
-func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
+func (s *packetSender) processPacket(pc C.PacketConn, packet *C.UDPPacket) {
 	defer packet.Drop()
-	metadata := packet.Metadata()
+	meta := packet.Meta
 
 	var addr *net.UDPAddr
 
 	s.mappingMutex.RLock()
-	targetAddr := s.originToTarget[metadata.String()]
+	targetAddr := s.originToTarget[meta.DstIP.Unmap()]
 	s.mappingMutex.RUnlock()
 
 	if targetAddr.IsValid() {
-		addr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(targetAddr, metadata.DstPort))
+		addr = s.setWriteAddr(netip.AddrPortFrom(targetAddr, meta.DstPort))
 	}
 
 	if addr == nil {
-		originMetadata := metadata  // save origin metadata
-		metadata = metadata.Clone() // don't modify PacketAdapter's metadata
+		originMetadata := meta
+		meta = meta.Clone()
 
-		_ = preHandleMetadata(metadata) // error was pre-checked
-		metadata = metadata.Pure()
-		if metadata.Host != "" {
-			// TODO: ResolveUDP may take a long time to block the Process loop
-			//       but we want keep sequence sending so can't open a new goroutine
-			if err := pc.ResolveUDP(s.ctx, metadata); err != nil {
+		_ = preHandleMetadata(meta)
+		meta = meta.Pure()
+		if meta.Host != "" {
+			if err := pc.ResolveUDP(s.ctx, meta); err != nil {
 				log.Warnln("[UDP] Resolve Ip error: %s", err)
 				return
 			}
 		}
 
-		if !metadata.DstIP.IsValid() {
-			log.Warnln("[UDP] Destination ip not valid: %#v", metadata)
+		if !meta.DstIP.IsValid() {
+			log.Warnln("[UDP] Destination ip not valid: %#v", meta)
 			return
 		}
-		s.AddMapping(originMetadata, metadata)
-		addr = metadata.UDPAddr()
+		s.AddMapping(originMetadata, meta)
+		addr = net.UDPAddrFromAddrPort(meta.AddrPort())
 	}
-	_ = handleUDPToRemote(packet, pc, addr)
+	_ = handleUDPToRemote(pc, s.writer, packet, addr)
 }
 
 func (s *packetSender) Process(pc C.PacketConn, proxy C.WriteBackProxy) {
+	s.writer = batch.NewWriter(pc)
 	for {
 		select {
 		case <-s.ctx.Done():
-			return // sender closed
+			return
 		case packet := <-s.ch:
 			if proxy != nil {
 				proxy.UpdateWriteBack(packet)
@@ -119,28 +137,28 @@ func (s *packetSender) dropAll() {
 	for {
 		select {
 		case data := <-s.ch:
-			data.Drop() // drop all data still in chan
+			data.Drop()
 		default:
-			return // no data, exit goroutine
+			return
 		}
 	}
 }
 
-func (s *packetSender) Send(packet C.PacketAdapter) {
+func (s *packetSender) Send(packet *C.UDPPacket) {
 	select {
 	case <-s.ctx.Done():
-		packet.Drop() // sender closed before Send()
+		packet.Drop()
 		return
 	default:
 	}
 
 	select {
 	case s.ch <- packet:
-		// put ok, so don't drop packet, will process by other side of chan
 	case <-s.ctx.Done():
-		packet.Drop() // sender closed when putting data to chan
+		packet.Drop()
 	default:
-		packet.Drop() // chan is full
+		AddDroppedSender(1)
+		packet.Drop()
 	}
 }
 
@@ -151,25 +169,49 @@ func (s *packetSender) Close() {
 
 func (s *packetSender) DoSniff(metadata *C.Metadata) error { return nil }
 
-func handleUDPToRemote(packet C.UDPPacket, pc C.PacketConn, addr *net.UDPAddr) error {
+func handleUDPToRemote(pc C.PacketConn, w batch.Writer, packet *C.UDPPacket, addr *net.UDPAddr) error {
 	if addr == nil {
 		return errors.New("udp addr invalid")
 	}
 
-	if _, err := pc.WriteTo(packet.Data(), addr); err != nil {
+	addrPort, ok := addrPortFromNetAddr(addr)
+	if !ok {
+		return errors.New("udp addr invalid")
+	}
+	buffers := [1]*buf.Buffer{packet.Buffer}
+	if err := w.WriteBatch(buffers[:], addrPort); err != nil {
 		return err
 	}
-	// reset timeout
+	AddBatchCalls(1)
+	AddBatchPackets(1)
 	_ = pc.SetReadDeadline(time.Now().Add(udpTimeout))
 
 	return nil
 }
 
-func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSender, key string, oAddrPort netip.AddrPort) {
+func addrPortFromNetAddr(addr net.Addr) (netip.AddrPort, bool) {
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		if a == nil {
+			return netip.AddrPort{}, false
+		}
+		return a.AddrPort(), true
+	case interface{ AddrPort() netip.AddrPort }:
+		return a.AddrPort(), true
+	default:
+		if addr == nil {
+			return netip.AddrPort{}, false
+		}
+		ap, err := netip.ParseAddrPort(addr.String())
+		return ap, err == nil
+	}
+}
+
+func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSender, key udpkey.FlowKey, lAddr string, oAddrPort netip.AddrPort) {
 	defer func() {
 		sender.Close()
 		_ = pc.Close()
-		closeAllLocalCoon(key)
+		closeAllLocalCoon(lAddr)
 		natTable.Delete(key)
 	}()
 
@@ -180,24 +222,16 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
 			return
 		}
 
-		fromUDPAddr, isUDPAddr := from.(*net.UDPAddr)
-		if !isUDPAddr {
-			fromUDPAddr = net.UDPAddrFromAddrPort(oAddrPort) // oAddrPort was Unmapped
-			log.Warnln("server return a [%T](%s) which isn't a *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", from, from, oAddrPort)
-		} else if fromUDPAddr == nil {
-			fromUDPAddr = net.UDPAddrFromAddrPort(oAddrPort) // oAddrPort was Unmapped
-			log.Warnln("server return a nil *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", oAddrPort)
+		fromAddrPort, ok := addrPortFromNetAddr(from)
+		if !ok || !fromAddrPort.IsValid() {
+			log.Warnln("server return a [%T](%s) which isn't a UDP address, force replace to (%s), this may be caused by a wrongly implemented server", from, from, oAddrPort)
+			fromAddrPort = oAddrPort
 		}
 
-		fromAddrPort := fromUDPAddr.AddrPort()
-		fromAddr := fromAddrPort.Addr().Unmap()
-
-		// restore DestinationNAT
-		fromAddr = sender.RestoreReadFrom(fromAddr).Unmap()
-
+		fromAddr := sender.RestoreReadFrom(fromAddrPort.Addr().Unmap()).Unmap()
 		fromAddrPort = netip.AddrPortFrom(fromAddr, fromAddrPort.Port())
 
-		_, err = writeBack.WriteBack(data, net.UDPAddrFromAddrPort(fromAddrPort))
+		_, err = writeBack.WriteBack(buf.As(data), fromAddrPort)
 		if put != nil {
 			put()
 		}

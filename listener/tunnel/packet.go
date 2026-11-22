@@ -2,35 +2,24 @@ package tunnel
 
 import (
 	"net"
+	"net/netip"
 
-	"github.com/metacubex/mihomo/common/pool"
+	"github.com/metacubex/mihomo/common/net/udpkey"
+
+	"github.com/metacubex/sing/common/buf"
 )
 
 type packet struct {
+	Buffer  *buf.Buffer
 	pc      net.PacketConn
 	rAddr   net.Addr
-	payload []byte
+	flowKey udpkey.FlowKey
 }
 
-func (c *packet) Data() []byte {
-	return c.payload
+func (c *packet) FlowKey() udpkey.FlowKey {
+	return c.flowKey
 }
 
-// WriteBack write UDP packet with source(ip, port) = `addr`
-func (c *packet) WriteBack(b []byte, addr net.Addr) (n int, err error) {
-	return c.pc.WriteTo(b, c.rAddr)
-}
-
-// LocalAddr returns the source IP/Port of UDP Packet
-func (c *packet) LocalAddr() net.Addr {
-	return c.rAddr
-}
-
-func (c *packet) Drop() {
-	_ = pool.Put(c.payload)
-	c.payload = nil
-}
-
-func (c *packet) InAddr() net.Addr {
-	return c.pc.LocalAddr()
+func (c *packet) WriteBack(b *buf.Buffer, src netip.AddrPort) (int, error) {
+	return c.pc.WriteTo(b.Bytes(), c.rAddr)
 }

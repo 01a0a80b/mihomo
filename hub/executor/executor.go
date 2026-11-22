@@ -96,6 +96,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	}
 
 	updateExperimental(cfg.Experimental)
+	updateUDP(cfg.UDP)
 	updateUsers(cfg.Users)
 	updateProxies(cfg.Proxies, cfg.Providers)
 	updateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
@@ -219,6 +220,13 @@ func updateExperimental(c *config.Experimental) {
 		_ = os.Setenv("QUIC_GO_DISABLE_ECN", strconv.FormatBool(true))
 	}
 	resolver.SetIP4PEnable(c.IP4PEnable)
+}
+
+func updateUDP(c *config.UDP) {
+	if c == nil {
+		return
+	}
+	tunnel.UpdateUDPConfig(c.WorkerCount, c.QueueSize, c.DropStrategy)
 }
 
 func updateNTP(c *config.NTP) {

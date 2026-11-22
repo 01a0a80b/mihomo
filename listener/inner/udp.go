@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -12,9 +13,11 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/common/net/deadline"
-	"github.com/metacubex/mihomo/common/pool"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/socks5"
+
+	"github.com/metacubex/sing/common/buf"
 )
 
 const innerUDPQueueSize = 128
@@ -30,8 +33,8 @@ func (a innerUDPAddr) Network() string { return a.network }
 func (a innerUDPAddr) String() string  { return a.address }
 
 type innerUDPDatagram struct {
-	data []byte
-	addr net.Addr
+	data *buf.Buffer
+	addr netip.AddrPort
 }
 
 type innerUDPPacketConn struct {
@@ -43,6 +46,7 @@ type innerUDPPacketConn struct {
 	closeOnce sync.Once
 	mu        sync.Mutex
 	closed    bool
+	inboundID uint32
 
 	readDeadline  deadline.PipeDeadline
 	writeDeadline deadline.PipeDeadline
@@ -68,6 +72,7 @@ func HandleUdp(tunnel C.Tunnel, network, address, proxy string) (net.PacketConn,
 		localAddr:     innerUDPAddr{network: network, address: fmt.Sprintf("inner-udp-%d", id)},
 		readChan:      make(chan innerUDPDatagram, innerUDPQueueSize),
 		done:          make(chan struct{}),
+		inboundID:     udpkey.NextInbound(),
 		readDeadline:  deadline.MakePipeDeadline(),
 		writeDeadline: deadline.MakePipeDeadline(),
 	}
@@ -81,12 +86,14 @@ func (c *innerUDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	case <-c.readDeadline.Wait():
 		return 0, nil, os.ErrDeadlineExceeded
 	case datagram := <-c.readChan:
-		n := copy(p, datagram.data)
-		_ = pool.Put(datagram.data)
-		if n < len(datagram.data) {
-			return n, datagram.addr, io.ErrShortBuffer
+		n := copy(p, datagram.data.Bytes())
+		short := n < datagram.data.Len()
+		addr := net.UDPAddrFromAddrPort(datagram.addr)
+		datagram.data.Release()
+		if short {
+			return n, addr, io.ErrShortBuffer
 		}
-		return n, datagram.addr, nil
+		return n, addr, nil
 	}
 }
 
@@ -106,14 +113,19 @@ func (c *innerUDPPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if target == nil {
 		return 0, fmt.Errorf("invalid target address %s", addr)
 	}
-	data := pool.Get(len(p))
-	copy(data, p)
-	udpPacket := &innerUDPPacket{conn: c, data: data}
-	packet, metadata := inbound.NewPacket(target, udpPacket, C.INNER)
+	b := buf.NewPacket()
+	b.Write(p)
+	udpPacket := &innerUDPPacket{
+		Buffer:  b,
+		conn:    c,
+		flowKey: udpkey.Make(c.inboundID, flowAddrPort(addr)),
+	}
+	_, metadata := inbound.NewPacket(target, udpPacket, C.INNER)
 	metadata.DNSMode = C.DNSNormal
 	metadata.Process = C.MihomoName
 	metadata.SpecialProxy = c.proxy
-	c.tunnel.HandleUDPPacket(packet, metadata)
+	up := C.NewUDPPacket(udpPacket.Buffer, metadata, udpPacket.FlowKey(), udpPacket)
+	c.tunnel.HandleUDPPacket(up, metadata)
 	return len(p), nil
 }
 
@@ -125,7 +137,7 @@ func (c *innerUDPPacketConn) Close() error {
 		for {
 			select {
 			case datagram := <-c.readChan:
-				_ = pool.Put(datagram.data)
+				datagram.data.Release()
 			default:
 				c.mu.Unlock()
 				return
@@ -153,42 +165,51 @@ func (c *innerUDPPacketConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (c *innerUDPPacketConn) writeBack(data []byte, addr net.Addr) (int, error) {
-	payload := pool.Get(len(data))
-	copy(payload, data)
-
+func (c *innerUDPPacketConn) writeBack(b *buf.Buffer, src netip.AddrPort) (int, error) {
+	payload := buf.NewPacket()
+	payload.Write(b.Bytes())
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		_ = pool.Put(payload)
+		payload.Release()
 		return 0, net.ErrClosed
 	}
 	select {
-	case c.readChan <- innerUDPDatagram{data: payload, addr: addr}:
+	case c.readChan <- innerUDPDatagram{data: payload, addr: src}:
+		return payload.Len(), nil
 	default:
-		_ = pool.Put(payload)
+		payload.Release()
+		return b.Len(), nil
 	}
-	return len(data), nil
 }
 
 type innerUDPPacket struct {
-	conn *innerUDPPacketConn
-	data []byte
+	Buffer  *buf.Buffer
+	conn    *innerUDPPacketConn
+	flowKey udpkey.FlowKey
 }
 
-func (p *innerUDPPacket) Data() []byte { return p.data }
-
-func (p *innerUDPPacket) WriteBack(data []byte, addr net.Addr) (int, error) {
-	return p.conn.writeBack(data, addr)
+func flowAddrPort(addr net.Addr) netip.AddrPort {
+	if a, ok := addr.(interface{ AddrPort() netip.AddrPort }); ok {
+		return a.AddrPort()
+	}
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		ip, _ := netip.AddrFromSlice(a.IP)
+		return netip.AddrPortFrom(ip, uint16(a.Port))
+	case *net.IPAddr:
+		ip, _ := netip.AddrFromSlice(a.IP)
+		return netip.AddrPortFrom(ip, 0)
+	}
+	return netip.AddrPort{}
 }
 
-func (p *innerUDPPacket) LocalAddr() net.Addr { return p.conn.localAddr }
-func (p *innerUDPPacket) InAddr() net.Addr    { return p.conn.localAddr }
+func (p *innerUDPPacket) FlowKey() udpkey.FlowKey {
+	return p.flowKey
+}
 
-func (p *innerUDPPacket) Drop() {
-	_ = pool.Put(p.data)
-	p.data = nil
+func (p *innerUDPPacket) WriteBack(b *buf.Buffer, src netip.AddrPort) (int, error) {
+	return p.conn.writeBack(b, src)
 }
 
 var _ net.PacketConn = (*innerUDPPacketConn)(nil)
-var _ C.UDPPacketInAddr = (*innerUDPPacket)(nil)

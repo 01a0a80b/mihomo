@@ -3,7 +3,6 @@ package sing
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -11,11 +10,11 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
-	"github.com/gofrs/uuid/v5"
 	mux "github.com/metacubex/sing-mux"
 	vmess "github.com/metacubex/sing-vmess"
 	"github.com/metacubex/sing-vmess/packetaddr"
@@ -53,7 +52,7 @@ type BrutalOptions struct {
 
 type ListenerHandler struct {
 	ListenerConfig
-	handlerId  uuid.UUID
+	inboundID  uint32
 	muxService *mux.Service
 }
 
@@ -74,7 +73,7 @@ func ConvertMetadata(metadata *C.Metadata) M.Metadata {
 
 func NewListenerHandler(lc ListenerConfig) (h *ListenerHandler, err error) {
 	h = &ListenerHandler{ListenerConfig: lc}
-	h.handlerId = utils.NewUUIDV4()
+	h.inboundID = udpkey.NextInbound()
 	h.muxService, err = mux.NewService(mux.ServiceOptions{
 		NewStreamContext: func(ctx context.Context, conn net.Conn) context.Context {
 			return ctx
@@ -155,7 +154,7 @@ func (h *ListenerHandler) NewPacketConnection(ctx context.Context, conn network.
 		conn = packetaddr.NewConn(bufio.NewNetPacketConn(conn), M.Socksaddr{})
 	}
 
-	connID := utils.NewUUIDV4().String() // make a new SNAT key
+	inboundID := udpkey.NextInbound()
 
 	defer func() { _ = conn.Close() }()
 	mutex := sync.Mutex{}
@@ -193,13 +192,13 @@ func (h *ListenerHandler) NewPacketConnection(ctx context.Context, conn network.
 			return err
 		}
 		cPacket := &packet{
-			writer: &writer,
-			mutex:  &mutex,
-			rAddr:  metadata.Source.UDPAddr(),
-			lAddr:  conn.LocalAddr(),
-			buff:   buff,
+			writer:  &writer,
+			mutex:   &mutex,
+			src:     metadata.Source.AddrPort(),
+			lAddr:   conn.LocalAddr(),
+			buff:    buff,
+			flowKey: udpkey.Make(inboundID, metadata.Source.AddrPort()),
 		}
-		cPacket.rAddr = N.NewCustomAddr(h.Type.String(), connID, cPacket.rAddr) // for tunnel's handleUDPConn
 		if lAddr := getInAddr(ctx); lAddr != nil {
 			cPacket.lAddr = lAddr
 		}
@@ -216,14 +215,11 @@ func (h *ListenerHandler) NewPacket(ctx context.Context, key netip.AddrPort, buf
 	writer := bufio.NewNetPacketWriter(init(nil))
 	mutex := sync.Mutex{}
 	cPacket := &packet{
-		writer: &writer,
-		mutex:  &mutex,
-		rAddr:  metadata.Source.UDPAddr(),
-		buff:   buffer,
-	}
-	if h.Type != C.TUN { // make the handler-related SNAT key for not TUN listener
-		connID := fmt.Sprintf("%s:%s", h.handlerId, key)
-		cPacket.rAddr = N.NewCustomAddr(h.Type.String(), connID, cPacket.rAddr) // for tunnel's handleUDPConn
+		writer:  &writer,
+		mutex:   &mutex,
+		src:     metadata.Source.AddrPort(),
+		buff:    buffer,
+		flowKey: udpkey.Make(h.inboundID, key),
 	}
 	if conn, ok := common.Cast[localAddr](writer); ok { // tun does not have real inAddr
 		cPacket.lAddr = conn.LocalAddr()
@@ -242,11 +238,11 @@ func (h *ListenerHandler) handlePacket(ctx context.Context, cPacket *packet, sou
 	if destination.IsIP() && destination.Fqdn == "" {
 		cMetadata.RawDstAddr = destination.Unwrap().UDPAddr()
 	}
-	inbound.ApplyAdditions(cMetadata, inbound.WithDstAddr(destination), inbound.WithSrcAddr(source), inbound.WithInAddr(cPacket.InAddr()))
+	inbound.ApplyAdditions(cMetadata, inbound.WithDstAddr(destination), inbound.WithSrcAddr(source), inbound.WithInAddr(cPacket.lAddr))
 	inbound.ApplyAdditions(cMetadata, h.Additions...)
 	inbound.ApplyAdditions(cMetadata, getAdditions(ctx)...)
 
-	h.Tunnel.HandleUDPPacket(cPacket, cMetadata)
+	h.Tunnel.HandleUDPPacket(C.NewUDPPacket(cPacket.buff, cMetadata, cPacket.flowKey, cPacket), cMetadata)
 }
 
 func (h *ListenerHandler) NewError(ctx context.Context, err error) {
@@ -256,6 +252,7 @@ func (h *ListenerHandler) NewError(ctx context.Context, err error) {
 func (h *ListenerHandler) TypeMutation(typ C.Type) *ListenerHandler {
 	handler := *h
 	handler.Type = typ
+	handler.inboundID = udpkey.NextInbound()
 	return &handler
 }
 
@@ -268,44 +265,27 @@ func ShouldIgnorePacketError(err error) bool {
 }
 
 type packet struct {
-	writer *network.NetPacketWriter
-	mutex  *sync.Mutex
-	rAddr  net.Addr
-	lAddr  net.Addr
-	buff   *buf.Buffer
+	writer  *network.NetPacketWriter
+	mutex   *sync.Mutex
+	src     netip.AddrPort
+	lAddr   net.Addr
+	buff    *buf.Buffer
+	flowKey udpkey.FlowKey
 }
 
-func (c *packet) Data() []byte {
-	return c.buff.Bytes()
+func (c *packet) FlowKey() udpkey.FlowKey {
+	return c.flowKey
 }
 
-// WriteBack wirtes UDP packet with source(ip, port) = `addr`
-func (c *packet) WriteBack(b []byte, addr net.Addr) (n int, err error) {
-	if addr == nil {
-		err = errors.New("address is invalid")
-		return
-	}
-
+func (c *packet) WriteBack(b *buf.Buffer, src netip.AddrPort) (n int, err error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	conn := *c.writer
 	if conn == nil {
-		err = errors.New("writeBack to closed connection")
-		return
+		return 0, errors.New("writeBack to closed connection")
 	}
-
-	return conn.WriteTo(b, addr)
-}
-
-// LocalAddr returns the source IP/Port of UDP Packet
-func (c *packet) LocalAddr() net.Addr {
-	return c.rAddr
-}
-
-func (c *packet) Drop() {
-	c.buff.Release()
-}
-
-func (c *packet) InAddr() net.Addr {
-	return c.lAddr
+	if !src.IsValid() {
+		src = c.src
+	}
+	return conn.WriteTo(b.Bytes(), net.UDPAddrFromAddrPort(src))
 }

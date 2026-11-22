@@ -161,9 +161,9 @@ type quicPacketSender struct {
 	closed bool
 }
 
-// Send will send PacketAdapter nonblocking
+// Send will send *UDPPacket nonblocking
 // the implement must call UDPPacket.Drop() inside Send
-func (q *quicPacketSender) Send(current constant.PacketAdapter) {
+func (q *quicPacketSender) Send(current *constant.UDPPacket) {
 	defer q.PacketSender.Send(current)
 
 	q.lock.RLock()
@@ -173,7 +173,7 @@ func (q *quicPacketSender) Send(current constant.PacketAdapter) {
 	}
 	q.lock.RUnlock()
 
-	err := q.readQUICData(current.Data())
+	err := q.readQUICData(current.Buffer.Bytes())
 	if err != nil {
 		q.close()
 		return

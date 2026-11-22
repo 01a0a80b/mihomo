@@ -2,6 +2,7 @@ package tuic
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"time"
@@ -20,11 +21,16 @@ import (
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/metacubex/quic-go"
+	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/tls"
 	"golang.org/x/exp/slices"
 )
 
 const ServerMaxIncomingStreams = (1 << 32) - 1
+
+type udpBufferPeer interface {
+	Buffer() *buf.Buffer
+}
 
 type Listener struct {
 	closed       bool
@@ -137,13 +143,19 @@ func New(config LC.TuicServer, lc C.InboundListenConfig, tunnel C.Tunnel, additi
 		go h.HandleSocket(addr, conn, _additions...) // h.HandleSocket will block, so open a new goroutine
 		return nil
 	}
-	handleUdpFn := func(addr socks5.Addr, packet C.UDPPacket, _additions ...inbound.Addition) error {
+	handleUdpFn := func(addr socks5.Addr, packet C.UDPPacketPeer, _additions ...inbound.Addition) error {
 		newAdditions := additions
 		if len(_additions) > 0 {
 			newAdditions = slices.Clip(additions) // force the subsequent `append()` to copy the slice
 			newAdditions = append(newAdditions, _additions...)
 		}
-		tunnel.HandleUDPPacket(inbound.NewPacket(addr, packet, C.TUIC, newAdditions...))
+		peer, ok := packet.(udpBufferPeer)
+		if !ok {
+			return errors.New("tuic: udp packet missing buffer")
+		}
+		_, metadata := inbound.NewPacket(addr, packet, C.TUIC, newAdditions...)
+		up := C.NewUDPPacket(peer.Buffer(), metadata, packet.FlowKey(), packet)
+		tunnel.HandleUDPPacket(up, metadata)
 		return nil
 	}
 

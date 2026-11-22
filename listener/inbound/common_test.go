@@ -87,7 +87,7 @@ var _ C.Dialer = (*TestDialer)(nil)
 
 type TestTunnel struct {
 	HandleTCPConnFn    func(conn net.Conn, metadata *C.Metadata)
-	HandleUDPPacketFn  func(packet C.UDPPacket, metadata *C.Metadata)
+	HandleUDPPacketFn  func(packet *C.UDPPacket, metadata *C.Metadata)
 	NatTableFn         func() C.NatTable
 	CloseFn            func() error
 	DoSequentialTestFn func(t *testing.T, proxy C.ProxyAdapter)
@@ -99,7 +99,7 @@ func (tt *TestTunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
 	tt.HandleTCPConnFn(conn, metadata)
 }
 
-func (tt *TestTunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
+func (tt *TestTunnel) HandleUDPPacket(packet *C.UDPPacket, metadata *C.Metadata) {
 	tt.HandleUDPPacketFn(packet, metadata)
 }
 
@@ -357,7 +357,7 @@ func NewHttpTestTunnel() *TestTunnel {
 			}
 			<-c.ch
 		},
-		HandleUDPPacketFn: func(packet C.UDPPacket, metadata *C.Metadata) {
+		HandleUDPPacketFn: func(packet *C.UDPPacket, metadata *C.Metadata) {
 			// TODO
 		},
 		CloseFn:            ln.Close,

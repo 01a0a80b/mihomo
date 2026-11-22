@@ -7,12 +7,12 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"io"
-	"net"
 	"net/netip"
 	"strings"
 	"testing"
 
 	"github.com/metacubex/mihomo/common/buf"
+	"github.com/metacubex/mihomo/common/net/udpkey"
 	"github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/quic-go/quicvarint"
 	"github.com/stretchr/testify/assert"
@@ -76,54 +76,18 @@ type fakeSender struct {
 
 var _ constant.PacketSender = (*fakeSender)(nil)
 
-func (e *fakeSender) Send(packet constant.PacketAdapter) {
-	// Ensure that the wrapper's Send can correctly handle the situation where the packet is directly discarded.
+func (e *fakeSender) Send(packet *constant.UDPPacket) {
 	packet.Drop()
 }
 
 func (e *fakeSender) DoSniff(metadata *constant.Metadata) error { return nil }
 
-type fakeUDPPacket struct {
-	data  []byte
-	data2 []byte // backup
-}
-
-func (s *fakeUDPPacket) InAddr() net.Addr {
-	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
-}
-
-func (s *fakeUDPPacket) LocalAddr() net.Addr {
-	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
-}
-
-func (s *fakeUDPPacket) Data() []byte {
-	return s.data
-}
-
-func (s *fakeUDPPacket) WriteBack(b []byte, addr net.Addr) (n int, err error) {
-	return 0, net.ErrClosed
-}
-
-func (s *fakeUDPPacket) Drop() {
-	for i := range s.data {
-		if s.data[i] != s.data2[i] { // ensure input data not changed
-			panic("data has been changed!")
-		}
-		s.data[i] = 0 // forcing data to become illegal
-	}
-	s.data = nil
-}
-
-var _ constant.UDPPacket = (*fakeUDPPacket)(nil)
-
-func asPacket(data string) constant.PacketAdapter {
+func asPacket(data string) *constant.UDPPacket {
 	pktData, _ := hex.DecodeString(data)
 
 	meta := &constant.Metadata{}
-	pkt := &fakeUDPPacket{data: pktData, data2: bytes.Clone(pktData)}
-	pktAdp := constant.NewPacketAdapter(pkt, meta)
-
-	return pktAdp
+	flow := udpkey.Make(1, netip.AddrPortFrom(netip.MustParseAddr("1.2.3.4"), 1234))
+	return constant.NewUDPPacket(buf.As(pktData), meta, flow, nil)
 }
 
 const fakeHost = "fake.host.com"

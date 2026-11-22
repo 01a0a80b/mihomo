@@ -52,7 +52,7 @@ func testInboundShadowQuic(t *testing.T, version string) {
 
 	tunnel := NewHttpTestTunnel()
 	defer tunnel.Close()
-	tunnel.HandleUDPPacketFn = func(packet C.UDPPacket, metadata *C.Metadata) {
+	tunnel.HandleUDPPacketFn = func(packet *C.UDPPacket, metadata *C.Metadata) {
 		packet.Drop()
 		t.Errorf("authenticated ShadowQUIC connection unexpectedly accessed JLS upstream %s", metadata.RemoteAddress())
 	}

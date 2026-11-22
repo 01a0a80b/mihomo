@@ -224,12 +224,12 @@ func testInboundSnellV6UDP(t *testing.T, mode string) {
 
 	tunnel := NewHttpTestTunnel()
 	defer tunnel.Close()
-	tunnel.HandleUDPPacketFn = func(packet C.UDPPacket, metadata *C.Metadata) {
+	tunnel.HandleUDPPacketFn = func(packet *C.UDPPacket, metadata *C.Metadata) {
 		defer packet.Drop()
 		if !assert.Equal(t, C.SNELL, metadata.Type) {
 			return
 		}
-		_, err := packet.WriteBack(packet.Data(), metadata.UDPAddr())
+		_, err := packet.WriteBack(packet.Buffer, metadata.AddrPort())
 		assert.NoError(t, err)
 	}
 
